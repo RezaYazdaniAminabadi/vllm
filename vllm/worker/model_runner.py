@@ -23,6 +23,8 @@ from vllm.sequence import (MultiModalData, SamplerOutput, SequenceData,
 from vllm.utils import (CudaMemoryProfiler, get_kv_cache_torch_dtype, is_hip,
                         is_pin_memory_available, make_tensor_with_pad)
 
+from vllm.model_executor.utils import ProfileFlag
+
 logger = init_logger(__name__)
 
 _PAD_SLOT_ID = -1
@@ -34,6 +36,8 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
     _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
 ]
 
+prepare_event = None
+model_forward_event = None
 
 class ModelInput(NamedTuple):
     input_tokens: torch.Tensor
@@ -652,6 +656,11 @@ class ModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
         kv_caches: List[torch.Tensor],
     ) -> Optional[SamplerOutput]:
+        global prepare_event, model_forward_event
+        if start_event is None:
+            prepare_event = torch.cuda.Event(enable_timing=True)
+            model_forward_event = torch.cuda.Event(enable_timing=True)
+
         (input_tokens, input_positions, attn_metadata, sampling_metadata,
          lora_requests, lora_mapping, multi_modal_input
          ) = self.prepare_input_tensors(seq_group_metadata_list)
@@ -672,11 +681,14 @@ class ModelRunner:
             "positions": input_positions,
             "kv_caches": kv_caches,
             "attn_metadata": attn_metadata,
+            "profile_flag": ProfileFlag.All # change this to profile different part of operation graph!
         }
+        prepare_event.record()
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
         hidden_states = model_executable(**execute_model_kwargs)
 
+        model_forward_event.record()
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
@@ -690,8 +702,15 @@ class ModelRunner:
             sampling_metadata=sampling_metadata,
         )
 
-        return output
+        torch.cuda.synchronize()
+        model_forward_latency = prepare_event.elapsed_time(model_forward_event)
 
+        return [
+            output,  
+            {
+                'model_forward': model_forward_latency,
+            }
+        ]
     @torch.inference_mode()
     def profile_run(self) -> None:
         # Enable top-k sampling to reflect the accurate memory usage.

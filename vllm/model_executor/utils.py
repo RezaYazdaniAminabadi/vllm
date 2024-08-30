@@ -4,7 +4,12 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+from enum import Enum
 
+class ProfileFlag(Enum):
+    GeMM = 1 # profile GeMM-only operations
+    GeMM_CoMM = 2 # profile GeMM + CoMM
+    All = 3 # profile all operations
 
 def set_random_seed(seed: int) -> None:
     random.seed(seed)

@@ -13,7 +13,7 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import set_weight_attrs, ProfileFlag
 
 logger = init_logger(__name__)
 
@@ -674,7 +674,7 @@ class RowParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, profile_flag=ProfileFlag.GeMM):
         # Set up backprop all-reduce.
         if self.input_is_parallel:
             input_parallel = input_
@@ -687,7 +687,7 @@ class RowParallelLinear(LinearBase):
         # Matrix multiply.
         assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_parallel)
-        if self.reduce_results and self.tp_size > 1:
+        if self.reduce_results and self.tp_size > 1 and profile_flag == ProfileFlag.GeMM_CoMM:
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output_ = output_parallel
