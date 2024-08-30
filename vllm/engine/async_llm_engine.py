@@ -47,6 +47,35 @@ def _raise_exception_on_finish(
             msg + " See stack trace above for the actual cause.") from e
 
 
+def print_latency(gpu_latency_set, title=""):
+    # 10 warmup queries
+
+    gpu_latency_set = gpu_latency_set[10:]
+    count = len(gpu_latency_set)
+    if count > 0:
+        gpu_latency_set.sort()
+        n50 = (count - 1) * 0.5 + 1
+        n90 = (count - 1) * 0.9 + 1
+        n95 = (count - 1) * 0.95 + 1
+        n99 = (count - 1) * 0.99 + 1
+        n999 = (count - 1) * 0.999 + 1
+
+        avg = sum(gpu_latency_set) / count
+        p50 = gpu_latency_set[int(n50) - 1]
+        p90 = gpu_latency_set[int(n90) - 1]
+        p95 = gpu_latency_set[int(n95) - 1]
+        p99 = gpu_latency_set[int(n99) - 1]
+        p999 = gpu_latency_set[int(n999) - 1]
+
+
+        print("====== latency stats {0} ======".format(title))
+        print("\tAvg Latency: {0:8.2f} ms".format(avg))
+        print("\tP50 Latency: {0:8.2f} ms".format(p50))
+        print("\tP90 Latency: {0:8.2f} ms".format(p90))
+        print("\tP95 Latency: {0:8.2f} ms".format(p95))
+        print("\tP99 Latency: {0:8.2f} ms".format(p99))
+        print("\t999 Latency: {0:8.2f} ms".format(p999))
+
 class AsyncStream:
     """A stream of RequestOutputs or EmbeddingRequestOutputs for a request
     that can be iterated over asynchronously."""
@@ -199,6 +228,9 @@ class RequestTracker:
 class _AsyncLLMEngine(LLMEngine):
     """Extension of LLMEngine to add async methods."""
 
+    all_latencies = {
+        'model_forward': [], 
+    }
     async def step_async(
             self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
@@ -224,6 +256,9 @@ class _AsyncLLMEngine(LLMEngine):
             )
             output = await self.model_executor.execute_model_async(
                 execute_model_req)
+            
+            latencies = output[-1]
+            output = output[0]
         else:
             output = []
 
@@ -234,6 +269,12 @@ class _AsyncLLMEngine(LLMEngine):
         # Log stats.
         self.do_log_stats(scheduler_outputs, output)
 
+        for key in latencies:
+            _AsyncLLMEngine.all_latencies[key].append(latencies[key])
+        if len(_AsyncLLMEngine.all_latencies['model_forward']) % 1000 == 0:
+            for key in _AsyncLLMEngine.all_latencies:
+                print_latency(_AsyncLLMEngine.all_latencies[key])
+                print(f'-'*50)
         return request_outputs
 
     async def encode_request_async(

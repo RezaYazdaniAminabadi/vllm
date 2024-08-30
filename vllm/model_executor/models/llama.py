@@ -49,6 +49,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_hip
 
+from vllm.model_executor.utils import ProfileFlag
 
 class LlamaMLP(nn.Module):
 
@@ -74,10 +75,13 @@ class LlamaMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, profile_flag: ProfileFlag = ProfileFlag.GeMM):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if profile_flag == ProfileFlag.All:
+            x = self.act_fn(gate_up)
+        else:
+            x = gate_up[..., gate_up.shape[-1] // 2]
+        x, _ = self.down_proj(x, profile_flag=profile_flag)
         return x
 
 
@@ -163,13 +167,15 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        profile_flag: ProfileFlag = ProfileFlag.GeMM
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
+        if profile_flag == ProfileFlag.All:
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
                                 self.kv_scale)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output if profile_flag == ProfileFlag.All else q, profile_flag=profile_flag)
         return output
 
 
@@ -228,25 +234,29 @@ class LlamaDecoderLayer(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        profile_flag: ProfileFlag = ProfileFlag.GeMM
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+        if profile_flag == ProfileFlag.All:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
+            profile_flag=profile_flag
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        if profile_flag == ProfileFlag.All:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+        hidden_states = self.mlp(hidden_states, profile_flag=profile_flag)
         return hidden_states, residual
 
 
@@ -287,6 +297,7 @@ class LlamaModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         inputs_embeds: Optional[torch.Tensor] = None,
+        profile_flag: ProfileFlag = ProfileFlag.GeMM,
     ) -> torch.Tensor:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -301,6 +312,7 @@ class LlamaModel(nn.Module):
                 kv_caches[i],
                 attn_metadata,
                 residual,
+                profile_flag
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -373,9 +385,10 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        profile_flag: ProfileFlag = ProfileFlag.GeMM
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata)
+                                   attn_metadata, profile_flag=profile_flag)
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
